@@ -29,22 +29,42 @@ class CryptoBot:
         self.app = Application.builder().token(self.token).build()
         self.session = aiohttp.ClientSession()
 
-    async def get_eth_price(self) -> float:
-        """Асинхронное получение цены ETH через CoinGecko API"""
-        url = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd"
+        # Монеты для мониторинга (id CoinGecko)
+        self.coins = {
+            "ETH": "ethereum",
+            "AERO": "aerodrome-finance",
+            "CRV": "curve-dao-token"
+        }
+
+        # Пороги тревог
+        self.thresholds = {
+            "ETH": float(os.getenv("ETH_CRITICAL_PRICE", 3000)),   # ниже этого → тревога
+            "CRV": float(os.getenv("CRV_CRITICAL_PRICE", 1.0)),    # выше этого → тревога
+            "AERO": float(os.getenv("AERO_CRITICAL_PRICE", 1.35))   # выше → тревога
+        }
+
+    async def get_prices(self) -> dict:
+        """Получение цен для всех монет"""
+        ids = ",".join(self.coins.values())
+        url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd"
         try:
             async with self.session.get(url, timeout=60) as response:
                 data = await response.json()
-                return float(data["ethereum"]["usd"])
+                prices = {
+                    symbol: data[cgid]["usd"]
+                    for symbol, cgid in self.coins.items()
+                    if cgid in data
+                }
+                return prices
         except Exception as e:
-            logger.error(f"Ошибка при получении цены ETH: {str(e)}")
-            return None
+            logger.error(f"Ошибка при получении цен: {str(e)}")
+            return {}
 
-    async def send_alert(self, price: float):
-        """Отправка предупреждения о падении цены"""
+    async def send_alert(self, symbol: str, price: float, condition: str):
+        """Отправка тревоги"""
         message = (
-            f"🚨 ETH Price Alert! 🚨\n"
-            f"Цена ETH упала ниже ${self.critical_price}!\n"
+            f"🚨 {symbol} Price Alert! 🚨\n"
+            f"Условие: {condition}\n"
             f"Текущая цена: ${price:,.2f}"
         )
         await self.send_message(message)
@@ -61,13 +81,22 @@ class CryptoBot:
             logger.error(f"Ошибка отправки сообщения: {str(e)}")
 
     async def price_check(self):
-        """Основная функция проверки цены"""
-        price = await self.get_eth_price()
-        if price:
-            logger.info(f"Текущая цена ETH: ${price:,.2f}")
-            if price < self.critical_price:
-                await self.send_alert(price)
-        return price
+        """Проверка цен и отправка алертов"""
+        prices = await self.get_prices()
+        if not prices:
+            return {}
+
+        for symbol, price in prices.items():
+            if symbol == "ETH":
+                if price < self.thresholds["ETH"]:
+                    await self.send_alert(symbol, price, f"упала ниже ${self.thresholds['ETH']}")
+            elif symbol == "CRV":
+                if price > self.thresholds["CRV"]:
+                    await self.send_alert(symbol, price, f"выросла выше ${self.thresholds['CRV']}")
+            elif symbol == "AERO":
+                if price > self.thresholds["AERO"]:
+                    await self.send_alert(symbol, price, f"выросла выше ${self.thresholds['AERO']}")
+        return prices
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /start"""
@@ -79,12 +108,15 @@ class CryptoBot:
 
     async def price_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик команды /price"""
-        price = await self.get_eth_price()
-        if price:
-            await update.message.reply_text(f"💰 Текущая цена ETH: ${price:,.2f}")
+        prices = await self.get_prices()
+        if prices:
+            msg = "💰 Текущие цены:\n"
+            for symbol, price in prices.items():
+                msg += f"- {symbol}: ${price:,.2f}\n"
+            await update.message.reply_text(msg)
         else:
-            await update.message.reply_text("Не удалось получить цену")
-
+            await update.message.reply_text("Не удалось получить цены")
+            
     async def run_checks(self):
         """Цикл проверки цены"""
         while True:
