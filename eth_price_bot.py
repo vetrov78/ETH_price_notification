@@ -2,112 +2,95 @@ import os
 import asyncio
 import aiohttp
 import logging
-from telegram import Bot, Update
+from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 
-# Настройка логов
+# --- Логи ---
 logging.basicConfig(
-    level=logging.WARNING,
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("bot.log"),  # Логи в файл
-        logging.StreamHandler()          # Логи в консоль
-    ]
+    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
-# Загрузка конфига
+# --- Конфиг ---
 load_dotenv("config.env")
 
+# --- Настройки монет ---
+COINS = {
+    "ETH": "ethereum",
+    "AERO": "aerodrome-finance",
+    "CRV": "curve-dao-token"
+}
+
+THRESHOLDS = {
+    "ETH": float(os.getenv("ETH_CRITICAL_PRICE", 3000)),
+    "CRV": float(os.getenv("CRV_CRITICAL_PRICE", 1.0)),
+    "AERO": float(os.getenv("AERO_CRITICAL_PRICE", 1.35))
+}
+
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 300))  # в секундах
+DAILY_HOUR = int(os.getenv("DAILY_REPORT_HOUR", 9))
+DAILY_MINUTE = int(os.getenv("DAILY_REPORT_MINUTE", 0))
+
+
+# --- Логика бота ---
 class CryptoBot:
-    def __init__(self):
-        self.token = os.getenv("TELEGRAM_TOKEN")
-        self.chat_id = os.getenv("CHAT_ID")
-        self.critical_price = float(os.getenv("ETH_CRITICAL_PRICE", 3000))
-        self.check_interval = 300  # 5 минут
-        self.app = Application.builder().token(self.token).build()
-        self.session = aiohttp.ClientSession()
+    def __init__(self, session, app, chat_id):
+        self.session = session
+        self.app = app
+        self.chat_id = chat_id
+        self.scheduler = AsyncIOScheduler()
 
-        # Монеты для мониторинга (id CoinGecko)
-        self.coins = {
-            "ETH": "ethereum",
-            "AERO": "aerodrome-finance",
-            "CRV": "curve-dao-token"
-        }
-
-        # Пороги тревог
-        self.thresholds = {
-            "ETH": float(os.getenv("ETH_CRITICAL_PRICE", 3000)),   # ниже этого → тревога
-            "CRV": float(os.getenv("CRV_CRITICAL_PRICE", 1.0)),    # выше этого → тревога
-            "AERO": float(os.getenv("AERO_CRITICAL_PRICE", 1.35))   # выше → тревога
-        }
-
-    async def get_prices(self) -> dict:
-        """Получение цен для всех монет"""
-        ids = ",".join(self.coins.values())
+    async def get_prices(self):
+        ids = ",".join(COINS.values())
         url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd"
         try:
-            async with self.session.get(url, timeout=60) as response:
-                data = await response.json()
-                prices = {
-                    symbol: data[cgid]["usd"]
-                    for symbol, cgid in self.coins.items()
-                    if cgid in data
-                }
-                return prices
+            async with self.session.get(url, timeout=30) as resp:
+                data = await resp.json()
+                return {symbol: data[cgid]["usd"] for symbol, cgid in COINS.items() if cgid in data}
         except Exception as e:
-            logger.error(f"Ошибка при получении цен: {str(e)}")
+            logger.error(f"Ошибка при получении цен: {e}")
             return {}
-
-    async def send_alert(self, symbol: str, price: float, condition: str):
-        """Отправка тревоги"""
-        message = (
-            f"🚨 {symbol} Price Alert! 🚨\n"
-            f"Условие: {condition}\n"
-            f"Текущая цена: ${price:,.2f}"
-        )
-        await self.send_message(message)
 
     async def send_message(self, text: str):
-        """Универсальная отправка сообщений"""
         try:
-            await self.app.bot.send_message(
-                chat_id=self.chat_id,
-                text=text,
-                parse_mode="Markdown"
-            )
+            await self.app.bot.send_message(chat_id=self.chat_id, text=text)
         except Exception as e:
-            logger.error(f"Ошибка отправки сообщения: {str(e)}")
+            logger.error(f"Ошибка отправки сообщения: {e}")
+
+    async def send_alert(self, symbol: str, price: float, condition: str):
+        msg = f"🚨 {symbol} Price Alert! 🚨\nУсловие: {condition}\nТекущая цена: ${price:,.2f}"
+        await self.send_message(msg)
 
     async def price_check(self):
-        """Проверка цен и отправка алертов"""
         prices = await self.get_prices()
-        if not prices:
-            return {}
-
         for symbol, price in prices.items():
-            if symbol == "ETH":
-                if price < self.thresholds["ETH"]:
-                    await self.send_alert(symbol, price, f"упала ниже ${self.thresholds['ETH']}")
-            elif symbol == "CRV":
-                if price > self.thresholds["CRV"]:
-                    await self.send_alert(symbol, price, f"выросла выше ${self.thresholds['CRV']}")
-            elif symbol == "AERO":
-                if price > self.thresholds["AERO"]:
-                    await self.send_alert(symbol, price, f"выросла выше ${self.thresholds['AERO']}")
-        return prices
+            if symbol == "ETH" and price < THRESHOLDS["ETH"]:
+                await self.send_alert(symbol, price, f"упала ниже ${THRESHOLDS['ETH']}")
+            elif symbol == "CRV" and price > THRESHOLDS["CRV"]:
+                await self.send_alert(symbol, price, f"выросла выше ${THRESHOLDS['CRV']}")
+            elif symbol == "AERO" and price > THRESHOLDS["AERO"]:
+                await self.send_alert(symbol, price, f"выросла выше ${THRESHOLDS['AERO']}")
 
-    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /start"""
+    async def send_daily_prices(self):
+        prices = await self.get_prices()
+        if prices:
+            msg = "🌅 Утренний отчёт по ценам:\n"
+            for symbol, price in prices.items():
+                msg += f"- {symbol}: ${price:,.2f}\n"
+            await self.send_message(msg)
+
+    async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "🤖 Бот для мониторинга цены ETH\n\n"
-            "Автоматически проверяет цену каждые 3 минуты\n"
-            f"Тревожный порог: ${self.critical_price}"
+            "🤖 Бот для мониторинга криптовалют\n"
+            f"Авто-проверка каждые {CHECK_INTERVAL} секунд.\n"
+            "Команда /price для текущих цен."
         )
 
-    async def price_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /price"""
+    async def cmd_price(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         prices = await self.get_prices()
         if prices:
             msg = "💰 Текущие цены:\n"
@@ -116,59 +99,58 @@ class CryptoBot:
             await update.message.reply_text(msg)
         else:
             await update.message.reply_text("Не удалось получить цены")
-            
+
     async def run_checks(self):
-        """Цикл проверки цены"""
         while True:
             try:
                 await self.price_check()
-                await asyncio.sleep(self.check_interval)
-            except asyncio.CancelledError:
-                break
+                await asyncio.sleep(CHECK_INTERVAL)
             except Exception as e:
-                logger.error(f"Ошибка в цикле проверки: {str(e)}")
+                logger.error(f"Ошибка в цикле проверки: {e}")
                 await asyncio.sleep(60)
 
-    async def run(self):
-        """Основной запуск бота"""
-        # Регистрация команд
-        self.app.add_handler(CommandHandler("start", self.start_command))
-        self.app.add_handler(CommandHandler("price", self.price_command))
+    async def shutdown(self):
+        self.scheduler.shutdown()
+        if self.session:
+            await self.session.close()
+        await self.send_message("🛑 Бот остановлен")
 
-        # Запуск бота
-        await self.send_message("🚀 Бот запущен")
-        await self.app.initialize()
-        await self.app.start()
-        await self.app.updater.start_polling()
 
-        # Запуск фоновой задачи
-        self.check_task = asyncio.create_task(self.run_checks())
+# --- Async main ---
+async def main():
+    token = os.getenv("TELEGRAM_TOKEN")
+    chat_id = os.getenv("CHAT_ID")
+
+    async with aiohttp.ClientSession() as session:
+        app = Application.builder().token(token).build()
+        bot = CryptoBot(session, app, chat_id)
+
+        # Регистрируем команды
+        app.add_handler(CommandHandler("start", bot.cmd_start))
+        app.add_handler(CommandHandler("price", bot.cmd_price))
+
+        # Фоновая проверка цен
+        asyncio.create_task(bot.run_checks())
+
+        # Планировщик утреннего отчёта
+        bot.scheduler.add_job(bot.send_daily_prices, "cron", hour=DAILY_HOUR, minute=DAILY_MINUTE)
+        bot.scheduler.start()
+
+        # Запуск polling
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling()
+        logger.info("Бот запущен")
 
         try:
             while True:
                 await asyncio.sleep(1)
         except asyncio.CancelledError:
-            await self.shutdown()
+            await bot.shutdown()
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
 
-    async def shutdown(self):
-        """Корректное завершение работы"""
-        self.check_task.cancel()
-        await self.send_message("🛑 Бот остановлен")
-        await self.session.close()
-        await self.app.updater.stop()
-        await self.app.stop()
-        await self.app.shutdown()
-
-async def main():
-    bot = CryptoBot()
-    try:
-        await bot.run()
-    except Exception as e:
-        logger.error(f"Фатальная ошибка: {str(e)}")
-        await bot.shutdown()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(main())
