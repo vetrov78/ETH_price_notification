@@ -21,12 +21,14 @@ load_dotenv("config.env")
 
 # --- Настройки монет ---
 COINS = {
+    "BTC": "bitcoin",
     "ETH": "ethereum",
     "AERO": "aerodrome-finance",
     "CRV": "curve-dao-token"
 }
 
 THRESHOLDS = {
+    "BTC": float(os.getenv("BTC_CRITICAL_PRICE", 55000)),   # ниже этой цены → тревога
     "ETH": float(os.getenv("ETH_CRITICAL_PRICE", 3000)),
     "CRV": float(os.getenv("CRV_CRITICAL_PRICE", 1.0)),
     "AERO": float(os.getenv("AERO_CRITICAL_PRICE", 1.35))
@@ -62,7 +64,9 @@ class CryptoBot:
     async def price_check(self):
         prices = await self.get_prices()
         for symbol, price in prices.items():
-            if symbol == "ETH" and price < THRESHOLDS["ETH"]:
+            if symbol == "BTC" and price < THRESHOLDS["BTC"]:
+                await self.send_alert(symbol, price, f"упал ниже ${THRESHOLDS['BTC']}")
+            elif symbol == "ETH" and price < THRESHOLDS["ETH"]:
                 await self.send_alert(symbol, price, f"упала ниже ${THRESHOLDS['ETH']}")
             elif symbol == "CRV" and price > THRESHOLDS["CRV"]:
                 await self.send_alert(symbol, price, f"выросла выше ${THRESHOLDS['CRV']}")
