@@ -36,6 +36,14 @@ THRESHOLDS = {
 
 # --- Настройки бота ---
 VAULT_API_URL = "https://api.prod.paradex.trade/v1/vaults"
+
+# Несколько публичных RPC для фолбэка
+ETH_RPC_URLS = os.getenv(
+    "ETH_RPC_URLS",
+    "https://ethereum.publicnode.com,https://cloudflare-eth.com,https://rpc.ankr.com/eth"
+).split(",")
+
+
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 300))  # в секундах
 DAILY_HOUR = int(os.getenv("DAILY_REPORT_HOUR", 9))
 DAILY_MINUTE = int(os.getenv("DAILY_REPORT_MINUTE", 0))
@@ -92,7 +100,6 @@ class CryptoBot:
             print("Ошибка при получении данных:", e)
             return None
 
-
     async def check_gigavault(self):
         vaults = await self.get_gigavault_data()
         # logger.info([x for x in vaults['results'] if x['name']=='Gigavault'])
@@ -113,6 +120,52 @@ class CryptoBot:
 
                 # Обновляем сохранённое значение
                 self.prev_max_tvl["Gigavault"] = max_tvl
+
+    # --- Получение информации о газе
+    async def get_eth_gas_gwei(self):
+        """Возвращает (gwei, None) или (None, error). Пробует несколько RPC по очереди."""
+        payload = {"jsonrpc": "2.0", "method": "eth_gasPrice", "params": [], "id": 1}
+        headers = {"Content-Type": "application/json"}
+        errors = []
+
+        for raw_url in ETH_RPC_URLS:
+            url = raw_url.strip()
+            if not url:
+                continue
+            try:
+                async with self.session.post(url, json=payload, headers=headers, timeout=30) as resp:
+                    if resp.status != 200:
+                        errors.append(f"{url} status {resp.status}")
+                        continue
+                    j = await resp.json(content_type=None)  # на случай неверного content-type
+                    wei_hex = j.get("result")
+                    if not wei_hex or not isinstance(wei_hex, str) or not wei_hex.startswith("0x"):
+                        errors.append(f"{url} no valid result: {j!r}")
+                        continue
+                    wei = int(wei_hex, 16)
+                    gwei = wei / 1e9
+                    return gwei, None
+            except Exception as e:
+                errors.append(f"{url} exception: {e}")
+
+        # если сюда дошли — ни один RPC не сработал
+        return None, " ; ".join(errors) or "No result from any RPC"
+
+    async def gas_check(self):
+        """Проверяет цену газа и присылает уведомление при низком уровне."""
+        gas_gwei, gerr = await self.get_eth_gas_gwei()
+        if gas_gwei is None:
+            logger.error(f"Ошибка получения газа: {gerr}")
+            return
+
+        critical = float(os.getenv("GAS_CRITICAL_GWEI", 0.2))
+        if gas_gwei < critical:
+            msg = (
+                f"⛽️ Газ в сети Ethereum опустился ниже порога!\n"
+                f"Текущая цена: {gas_gwei:.2f} gwei\n"
+                f"Пороговое значение: {critical:.2f} gwei"
+            )
+            await self.send_message(msg)
 
     # --- Telegram ---
     async def send_message(self, text: str):
@@ -135,10 +188,26 @@ class CryptoBot:
     async def cmd_price(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         prices = await self.get_prices()
         if prices:
-            msg = "💰 Текущие цены:\n"
-            for symbol, price in prices.items():
-                msg += f"- {symbol}: ${price:,.2f}\n"
-            await update.message.reply_text(msg)
+            msg_lines = ["💰 Текущие цены:"]
+            # выводим в фиксированном порядке
+            for symbol in ["BTC", "ETH", "CRV", "AERO"]:
+                if symbol in prices:
+                    msg_lines.append(f"- {symbol}: ${prices[symbol]:,.2f}")
+
+            # цена газа
+            # внутри cmd_price, после вывода монет
+            gas_gwei, gerr = await self.get_eth_gas_gwei()
+            if gas_gwei is not None:
+                msg_lines.append(f"- GAS: {gas_gwei:.2f} gwei")
+            else:
+                msg_lines.append(f"- GAS: ошибка ({gerr})")
+
+            if gas_gwei is not None:
+                msg_lines.append(f"- GAS: {gas_gwei:.2f} gwei")
+            else:
+                msg_lines.append(f"- GAS: ошибка ({gerr})")
+
+            await update.message.reply_text("\n".join(msg_lines))
         else:
             await update.message.reply_text("Не удалось получить цены")
 
@@ -147,6 +216,7 @@ class CryptoBot:
             try:
                 await self.price_check()
                 await self.check_gigavault()
+                await self.gas_check()
                 await asyncio.sleep(CHECK_INTERVAL)
             except Exception as e:
                 logger.error(f"Ошибка в цикле проверки: {e}")
