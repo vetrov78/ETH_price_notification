@@ -152,20 +152,43 @@ class CryptoBot:
         return None, " ; ".join(errors) or "No result from any RPC"
 
     async def gas_check(self):
-        """Проверяет цену газа и присылает уведомление при низком уровне."""
+        """Присылает уведомления только при пересечении порога:
+        - один раз при снижении (впервые ушли ниже порога),
+        - один раз при повышении (впервые вернулись на/выше порога).
+        """
         gas_gwei, gerr = await self.get_eth_gas_gwei()
         if gas_gwei is None:
             logger.error(f"Ошибка получения газа: {gerr}")
             return
 
-        critical = float(os.getenv("GAS_CRITICAL_GWEI", 0.2))
-        if gas_gwei < critical:
-            msg = (
-                f"⛽️ Газ в сети Ethereum опустился ниже порога!\n"
+        critical = float(os.getenv("GAS_CRITICAL_GWEI", 7.0))
+
+        # Первичная инициализация состояния без уведомления (чтобы не спамить при старте)
+        if self.gas_below_threshold is None:
+            self.gas_below_threshold = gas_gwei < critical
+            return
+
+        # Пересечение вниз: было >= порога, стало < порога
+        if gas_gwei < critical and self.gas_below_threshold is False:
+            self.gas_below_threshold = True
+            await self.send_message(
+                "⛽️ Газ в сети Ethereum опустился ниже порога!\n"
                 f"Текущая цена: {gas_gwei:.2f} gwei\n"
                 f"Пороговое значение: {critical:.2f} gwei"
             )
-            await self.send_message(msg)
+            return
+
+        # Пересечение вверх: было < порога, стало >= порога
+        if gas_gwei >= critical and self.gas_below_threshold is True:
+            self.gas_below_threshold = False
+            await self.send_message(
+                "✅ Газ в сети Ethereum поднялся выше порога.\n"
+                f"Текущая цена: {gas_gwei:.2f} gwei\n"
+                f"Пороговое значение: {critical:.2f} gwei"
+            )
+            return
+
+        # Иначе — состояние не менялось, ничего не отправляем
 
     # --- Telegram ---
     async def send_message(self, text: str):
