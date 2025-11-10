@@ -56,6 +56,7 @@ class CryptoBot:
         self.chat_id = chat_id
         self.scheduler = AsyncIOScheduler()
         self.prev_max_tvl = {'Gigavault': 60000000}  # словарь vault_name -> max_tvl
+        self.gas_below_threshold = None
 
     # --- Крипто ---
     async def get_prices(self):
@@ -152,23 +153,39 @@ class CryptoBot:
         return None, " ; ".join(errors) or "No result from any RPC"
 
     async def gas_check(self):
-        """Присылает уведомления только при пересечении порога:
-        - один раз при снижении (впервые ушли ниже порога),
-        - один раз при повышении (впервые вернулись на/выше порога).
+        """Уведомления по газу:
+        - при первом запуске: если газ < порога — сразу шлём предупреждение;
+        - дальше: алерт только при пересечении порога вниз/вверх.
         """
         gas_gwei, gerr = await self.get_eth_gas_gwei()
         if gas_gwei is None:
             logger.error(f"Ошибка получения газа: {gerr}")
             return
 
-        critical = float(os.getenv("GAS_CRITICAL_GWEI", 7.0))
+        raw_critical = os.getenv("GAS_CRITICAL_GWEI", "7.0")
+        try:
+            critical = float(raw_critical.replace(",", "."))
+        except ValueError:
+            logger.error(f"Некорректное значение GAS_CRITICAL_GWEI='{raw_critical}', использую 7.0")
+            critical = 7.0
 
-        # Первичная инициализация состояния без уведомления (чтобы не спамить при старте)
+        logger.info(f"gas_check: gas={gas_gwei:.4f} gwei, critical={critical:.4f}, "
+                    f"state={self.gas_below_threshold}")
+
+        # 1) Первичная инициализация
         if self.gas_below_threshold is None:
             self.gas_below_threshold = gas_gwei < critical
+
+            # Если уже ниже порога — сразу предупреждаем один раз
+            if self.gas_below_threshold:
+                await self.send_message(
+                    "⛽️ Газ в сети Ethereum уже ниже порога!\n"
+                    f"Текущая цена: {gas_gwei:.2f} gwei\n"
+                    f"Пороговое значение: {critical:.2f} gwei"
+                )
             return
 
-        # Пересечение вниз: было >= порога, стало < порога
+        # 2) Пересечение вниз (было >=, стало <)
         if gas_gwei < critical and self.gas_below_threshold is False:
             self.gas_below_threshold = True
             await self.send_message(
@@ -178,7 +195,7 @@ class CryptoBot:
             )
             return
 
-        # Пересечение вверх: было < порога, стало >= порога
+        # 3) Пересечение вверх (было <, стало >=)
         if gas_gwei >= critical and self.gas_below_threshold is True:
             self.gas_below_threshold = False
             await self.send_message(
@@ -188,7 +205,7 @@ class CryptoBot:
             )
             return
 
-        # Иначе — состояние не менялось, ничего не отправляем
+        # 4) Состояние не изменилось — молчим
 
     # --- Telegram ---
     async def send_message(self, text: str):
@@ -220,11 +237,6 @@ class CryptoBot:
             # цена газа
             # внутри cmd_price, после вывода монет
             gas_gwei, gerr = await self.get_eth_gas_gwei()
-            if gas_gwei is not None:
-                msg_lines.append(f"- GAS: {gas_gwei:.2f} gwei")
-            else:
-                msg_lines.append(f"- GAS: ошибка ({gerr})")
-
             if gas_gwei is not None:
                 msg_lines.append(f"- GAS: {gas_gwei:.2f} gwei")
             else:
