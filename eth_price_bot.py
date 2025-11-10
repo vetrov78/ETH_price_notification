@@ -28,8 +28,8 @@ COINS = {
 }
 
 THRESHOLDS = {
-    "BTC": float(os.getenv("BTC_CRITICAL_PRICE", 55000)),   # ниже этой цены → тревога
-    "ETH": float(os.getenv("ETH_CRITICAL_PRICE", 3000)),
+    "BTC": float(os.getenv("BTC_CRITICAL_PRICE", 99000)),   # ниже этой цены → тревога
+    "ETH": float(os.getenv("ETH_CRITICAL_PRICE", 3300)),
     "CRV": float(os.getenv("CRV_CRITICAL_PRICE", 1.0)),
     "AERO": float(os.getenv("AERO_CRITICAL_PRICE", 1.35))
 }
@@ -48,6 +48,16 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 300))  # в секундах
 DAILY_HOUR = int(os.getenv("DAILY_REPORT_HOUR", 9))
 DAILY_MINUTE = int(os.getenv("DAILY_REPORT_MINUTE", 0))
 
+# --- Gigavault ---
+GIGAVAULT_START_MAX_TVL_RAW = os.getenv("GIGAVAULT_START_MAX_TVL", "90000000")
+try:
+    GIGAVAULT_START_MAX_TVL = float(GIGAVAULT_START_MAX_TVL_RAW.replace(",", "."))
+except ValueError:
+    logger.error(
+        f"Некорректное значение GIGAVAULT_START_MAX_TVL='{GIGAVAULT_START_MAX_TVL_RAW}', использую 90000000"
+    )
+    GIGAVAULT_START_MAX_TVL = 90000000.0
+
 # --- Логика бота ---
 class CryptoBot:
     def __init__(self, session, app, chat_id):
@@ -55,7 +65,7 @@ class CryptoBot:
         self.app = app
         self.chat_id = chat_id
         self.scheduler = AsyncIOScheduler()
-        self.prev_max_tvl = {'Gigavault': 60000000}  # словарь vault_name -> max_tvl
+        self.prev_max_tvl = {'Gigavault': GIGAVAULT_START_MAX_TVL}
         self.gas_below_threshold = None
 
     # --- Крипто ---
@@ -103,7 +113,6 @@ class CryptoBot:
 
     async def check_gigavault(self):
         vaults = await self.get_gigavault_data()
-        # logger.info([x for x in vaults['results'] if x['name']=='Gigavault'])
 
         for vault in vaults['results']:
             # Проверяем название именно в объекте

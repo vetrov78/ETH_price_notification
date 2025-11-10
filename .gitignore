@@ -1,3 +1,7 @@
+# локальные конфиги и секреты
 config.env
+.env
+*.local.env
+
 *.log
 __pycache__/
