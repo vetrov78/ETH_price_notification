@@ -94,11 +94,23 @@ class CryptoBot:
 
     async def send_daily_prices(self):
         prices = await self.get_prices()
+        msg = "🌅 Утренний отчёт по ценам:\n"
+
         if prices:
-            msg = "🌅 Утренний отчёт по ценам:\n"
-            for symbol, price in prices.items():
-                msg += f"- {symbol}: ${price:,.2f}\n"
-            await self.send_message(msg)
+            for symbol in ["BTC", "ETH", "CRV", "AERO"]:
+                if symbol in prices:
+                    msg += f"- {symbol}: ${prices[symbol]:,.2f}\n"
+        else:
+            msg += "— Не удалось получить цены монет\n"
+
+        # Добавляем газ
+        gas_gwei, gerr = await self.get_eth_gas_gwei()
+        if gas_gwei is not None:
+            msg += f"- GAS: {gas_gwei:.2f} gwei\n"
+        else:
+            msg += f"- GAS: ошибка ({gerr})\n"
+
+        await self.send_message(msg)
 
     # --- Получение данных Gigavault ---
     async def get_gigavault_data(self):
