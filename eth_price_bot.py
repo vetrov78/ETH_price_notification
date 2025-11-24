@@ -27,6 +27,7 @@ COINS = {
     "CRV": "curve-dao-token"
 }
 
+
 THRESHOLDS = {
     "BTC": float(os.getenv("BTC_CRITICAL_PRICE", 99000)),   # ниже этой цены → тревога
     "ETH": float(os.getenv("ETH_CRITICAL_PRICE", 3300)),
@@ -68,6 +69,14 @@ class CryptoBot:
         self.prev_max_tvl = {'Gigavault': GIGAVAULT_START_MAX_TVL}
         self.gas_below_threshold = None
 
+        # локальные пороги, которые можно менять во время работы
+        self.thresholds = {
+            "BTC": THRESHOLDS["BTC"],
+            "ETH": THRESHOLDS["ETH"],
+            "CRV": THRESHOLDS["CRV"],
+            "AERO": THRESHOLDS["AERO"],
+        }
+
     # --- Крипто ---
     async def get_prices(self):
         ids = ",".join(COINS.values())
@@ -83,13 +92,13 @@ class CryptoBot:
     async def price_check(self):
         prices = await self.get_prices()
         for symbol, price in prices.items():
-            if symbol == "BTC" and price < THRESHOLDS["BTC"]:
+            if symbol == "BTC" and price < self.thresholds["BTC"]:
                 await self.send_alert(symbol, price, f"упал ниже ${THRESHOLDS['BTC']}")
-            elif symbol == "ETH" and price < THRESHOLDS["ETH"]:
+            elif symbol == "ETH" and price < self.thresholds["ETH"]:
                 await self.send_alert(symbol, price, f"упала ниже ${THRESHOLDS['ETH']}")
-            elif symbol == "CRV" and price > THRESHOLDS["CRV"]:
+            elif symbol == "CRV" and price > self.thresholds["CRV"]:
                 await self.send_alert(symbol, price, f"выросла выше ${THRESHOLDS['CRV']}")
-            elif symbol == "AERO" and price > THRESHOLDS["AERO"]:
+            elif symbol == "AERO" and price > self.thresholds["AERO"]:
                 await self.send_alert(symbol, price, f"выросла выше ${THRESHOLDS['AERO']}")
 
     async def send_daily_prices(self):
@@ -267,6 +276,50 @@ class CryptoBot:
         else:
             await update.message.reply_text("Не удалось получить цены")
 
+    async def cmd_set(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда: /set <COIN> <VALUE>
+        Примеры:
+        /set BTC 95000
+        /set CRV 0.9
+        """
+        if len(context.args) != 2:
+            await update.message.reply_text(
+                "Использование: /set <COIN> <VALUE>\n"
+                "Например: /set BTC 95000"
+            )
+            return
+
+        symbol = context.args[0].upper()
+        value_str = context.args[1].replace(",", ".")  # на всякий случай, если введёшь с запятой
+
+        if symbol not in self.thresholds:
+            await update.message.reply_text(
+                f"Неизвестная монета: {symbol}\n"
+                f"Доступные: {', '.join(self.thresholds.keys())}"
+            )
+            return
+
+        try:
+            new_value = float(value_str)
+        except ValueError:
+            await update.message.reply_text("Не получилось прочитать число. Пример: /set BTC 95000")
+            return
+
+        old_value = self.thresholds[symbol]
+        self.thresholds[symbol] = new_value
+
+        await update.message.reply_text(
+            f"✅ Порог для {symbol} обновлён:\n"
+            f"было: {old_value}\n"
+            f"стало: {new_value}"
+        )
+
+    async def cmd_thresholds(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        lines = ["Текущие пороги:"]
+        for symbol, value in self.thresholds.items():
+            lines.append(f"- {symbol}: {value}")
+        await update.message.reply_text("\n".join(lines))
+
     async def run_checks(self):
         while True:
             try:
@@ -296,6 +349,9 @@ async def main():
         # --- Регистрируем команды ---
         app.add_handler(CommandHandler("start", bot.cmd_start))
         app.add_handler(CommandHandler("price", bot.cmd_price))
+        app.add_handler(CommandHandler("set", bot.cmd_set))
+        app.add_handler(CommandHandler("thresholds", bot.cmd_thresholds))
+
 
         # --- Уведомление о запуске ---
         await bot.send_message("✅ Бот запущен")
