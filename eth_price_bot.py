@@ -139,12 +139,20 @@ class CryptoBot:
     # --- Получение данных Gigavault ---
     async def get_gigavault_data(self):
         try:
-            response = requests.get(VAULT_API_URL, headers={"Accept": "application/json"})
-            response.raise_for_status()
-            return response.json()
+            async with self.session.get(
+                VAULT_API_URL,
+                headers={"Accept": "application/json"},
+                timeout=30
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.error(f"Gigavault API status={resp.status}, body={body[:200]}")
+                    return None
+
+                return await resp.json(content_type=None)
 
         except Exception as e:
-            print("Ошибка при получении данных:", e)
+            logger.error(f"Ошибка при получении данных Gigavault: {e}")
             return None
 
     async def check_gigavault(self):
