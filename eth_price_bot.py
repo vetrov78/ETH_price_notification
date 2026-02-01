@@ -24,15 +24,13 @@ COINS = {
     "BTC": "bitcoin",
     "ETH": "ethereum",
     "AERO": "aerodrome-finance",
-    "CRV": "curve-dao-token"
-}
 
+}
 
 THRESHOLDS = {
     "BTC": float(os.getenv("BTC_CRITICAL_PRICE", 99000)),   # ниже этой цены → тревога
     "ETH": float(os.getenv("ETH_CRITICAL_PRICE", 3300)),
-    "CRV": float(os.getenv("CRV_CRITICAL_PRICE", 1.0)),
-    "AERO": float(os.getenv("AERO_CRITICAL_PRICE", 1.35))
+    "AERO": float(os.getenv("AERO_CRITICAL_PRICE", 0.2))
 }
 
 # --- Настройки бота ---
@@ -59,6 +57,25 @@ except ValueError:
     )
     GIGAVAULT_START_MAX_TVL = 90000000.0
 
+def update_env_value(env_path: str, key: str, value: str):
+        lines = []
+        found = False
+
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip().startswith(f"{key}="):
+                        lines.append(f"{key}={value}\n")
+                        found = True
+                    else:
+                        lines.append(line)
+
+        if not found:
+            lines.append(f"{key}={value}\n")
+
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+
 # --- Логика бота ---
 class CryptoBot:
     def __init__(self, session, app, chat_id):
@@ -73,7 +90,6 @@ class CryptoBot:
         self.thresholds = {
             "BTC": THRESHOLDS["BTC"],
             "ETH": THRESHOLDS["ETH"],
-            "CRV": THRESHOLDS["CRV"],
             "AERO": THRESHOLDS["AERO"],
         }
 
@@ -96,7 +112,6 @@ class CryptoBot:
                 await self.send_alert(symbol, price, f"упал ниже ${THRESHOLDS['BTC']}")
             elif symbol == "ETH" and price < self.thresholds["ETH"]:
                 await self.send_alert(symbol, price, f"упала ниже ${THRESHOLDS['ETH']}")
-            elif symbol == "CRV" and price > self.thresholds["CRV"]:
                 await self.send_alert(symbol, price, f"выросла выше ${THRESHOLDS['CRV']}")
             elif symbol == "AERO" and price > self.thresholds["AERO"]:
                 await self.send_alert(symbol, price, f"выросла выше ${THRESHOLDS['AERO']}")
@@ -106,7 +121,7 @@ class CryptoBot:
         msg = "🌅 Утренний отчёт по ценам:\n"
 
         if prices:
-            for symbol in ["BTC", "ETH", "CRV", "AERO"]:
+            for symbol in ["BTC", "ETH", "AERO"]:
                 if symbol in prices:
                     msg += f"- {symbol}: ${prices[symbol]:,.2f}\n"
         else:
@@ -260,7 +275,7 @@ class CryptoBot:
         if prices:
             msg_lines = ["💰 Текущие цены:"]
             # выводим в фиксированном порядке
-            for symbol in ["BTC", "ETH", "CRV", "AERO"]:
+            for symbol in ["BTC", "ETH", "AERO"]:
                 if symbol in prices:
                     msg_lines.append(f"- {symbol}: ${prices[symbol]:,.2f}")
 
@@ -307,6 +322,9 @@ class CryptoBot:
 
         old_value = self.thresholds[symbol]
         self.thresholds[symbol] = new_value
+        env_key = f"{symbol}_CRITICAL_PRICE"
+        update_env_value("config.env", env_key, value_str)
+        os.environ[env_key] = value_str  # опционально, чтобы getenv тоже видел новое значение в этом процессе
 
         await update.message.reply_text(
             f"✅ Порог для {symbol} обновлён:\n"
