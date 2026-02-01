@@ -109,11 +109,11 @@ class CryptoBot:
         prices = await self.get_prices()
         for symbol, price in prices.items():
             if symbol == "BTC" and price < self.thresholds["BTC"]:
-                await self.send_alert(symbol, price, f"упал ниже ${THRESHOLDS['BTC']}")
+                await self.send_alert(symbol, price, f"упал ниже ${self.thresholds['BTC']}")
             elif symbol == "ETH" and price < self.thresholds["ETH"]:
-                await self.send_alert(symbol, price, f"упала ниже ${THRESHOLDS['ETH']}")
-                await self.send_alert(symbol, price, f"выросла выше ${THRESHOLDS['CRV']}")
+                await self.send_alert(symbol, price, f"упала ниже ${self.thresholds['ETH']}")
             elif symbol == "AERO" and price > self.thresholds["AERO"]:
+                await self.send_alert(symbol, price, f"выросла выше ${self.thresholds['AERO']}")
                 await self.send_alert(symbol, price, f"выросла выше ${THRESHOLDS['AERO']}")
 
     async def send_daily_prices(self):
