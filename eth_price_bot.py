@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import aiohttp
 import logging
@@ -33,6 +34,9 @@ THRESHOLDS = {
     "AERO": float(os.getenv("AERO_CRITICAL_PRICE", 0.2))
 }
 
+SUSN_APP_URL = "https://app.noon.capital/"
+NOON_TVL_URL = "https://defillama.com/protocol/noon"
+
 # --- Настройки бота ---
 VAULT_API_URL = "https://api.prod.paradex.trade/v1/vaults"
 
@@ -41,7 +45,6 @@ ETH_RPC_URLS = os.getenv(
     "ETH_RPC_URLS",
     "https://ethereum.publicnode.com,https://cloudflare-eth.com,https://rpc.ankr.com/eth"
 ).split(",")
-
 
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 300))  # в секундах
 DAILY_HOUR = int(os.getenv("DAILY_REPORT_HOUR", 9))
@@ -85,6 +88,8 @@ class CryptoBot:
         self.scheduler = AsyncIOScheduler()
         self.prev_max_tvl = {'Gigavault': GIGAVAULT_START_MAX_TVL}
         self.gas_below_threshold = None
+        self.prev_susn_apy_below = None
+        self.prev_susn_tvl_below = None
 
         # локальные пороги, которые можно менять во время работы
         self.thresholds = {
@@ -113,7 +118,6 @@ class CryptoBot:
             elif symbol == "ETH" and price < self.thresholds["ETH"]:
                 await self.send_alert(symbol, price, f"упала ниже ${self.thresholds['ETH']}")
             elif symbol == "AERO" and price > self.thresholds["AERO"]:
-                await self.send_alert(symbol, price, f"выросла выше ${self.thresholds['AERO']}")
                 await self.send_alert(symbol, price, f"выросла выше ${THRESHOLDS['AERO']}")
 
     async def send_daily_prices(self):
@@ -127,15 +131,174 @@ class CryptoBot:
         else:
             msg += "— Не удалось получить цены монет\n"
 
-        # Добавляем газ
+        # --- GAS ---
         gas_gwei, gerr = await self.get_eth_gas_gwei()
         if gas_gwei is not None:
             msg += f"- GAS: {gas_gwei:.2f} gwei\n"
         else:
             msg += f"- GAS: ошибка ({gerr})\n"
 
-        await self.send_message(msg)
+        # --- sUSN ---
+        susn_metrics, serr = await self.get_susn_metrics()
+        if susn_metrics:
+            if susn_metrics.get("apy_7d") is not None:
+                msg += f"- sUSN 7d APY: {susn_metrics['apy_7d']:.2f}%\n"
+            if susn_metrics.get("tvl_usd") is not None:
+                msg += f"- Noon TVL: ${susn_metrics['tvl_usd']:,.0f}\n"
+        else:
+            msg += f"- sUSN: ошибка ({serr})\n"
 
+        await self.send_message(msg)
+        
+    async def get_susn_metrics(self):
+        apy_7d = None
+        tvl_usd = None
+        errors = []
+
+        # --- sUSN 7D APY с Noon app ---
+        try:
+            async with self.session.get(
+                SUSN_APP_URL,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=30
+            ) as resp:
+                if resp.status != 200:
+                    errors.append(f"Noon app status {resp.status}")
+                else:
+                    html = await resp.text()
+
+                    patterns = [
+                        r"APY,\s*7D[^0-9]{0,40}([0-9]+(?:\.[0-9]+)?)%",
+                        r"7D[^0-9]{0,20}APY[^0-9]{0,40}([0-9]+(?:\.[0-9]+)?)%",
+                        r"sUSN[^0-9]{0,40}([0-9]+(?:\.[0-9]+)?)%[^%]{0,80}APY,\s*7D"
+                    ]
+
+                    for pattern in patterns:
+                        m = re.search(pattern, html, flags=re.IGNORECASE | re.DOTALL)
+                        if m:
+                            apy_7d = float(m.group(1))
+                            break
+
+                    if apy_7d is None:
+                        errors.append("Noon app 7D APY not found")
+        except Exception as e:
+            errors.append(f"Noon app exception: {e}")
+
+        # --- TVL с DefiLlama страницы Noon ---
+        try:
+            async with self.session.get(
+                NOON_TVL_URL,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=30
+            ) as resp:
+                if resp.status != 200:
+                    errors.append(f"DefiLlama status {resp.status}")
+                else:
+                    html = await resp.text()
+
+                    m = re.search(
+                        r"Total Value Locked\s*\$([0-9]+(?:\.[0-9]+)?)\s*([mbk]?)",
+                        html,
+                        flags=re.IGNORECASE
+                    )
+                    if m:
+                        value = float(m.group(1))
+                        suffix = m.group(2).lower()
+
+                        if suffix == "b":
+                            tvl_usd = value * 1_000_000_000
+                        elif suffix == "m":
+                            tvl_usd = value * 1_000_000
+                        elif suffix == "k":
+                            tvl_usd = value * 1_000
+                        else:
+                            tvl_usd = value
+                    else:
+                        errors.append("DefiLlama TVL not found")
+        except Exception as e:
+            errors.append(f"DefiLlama exception: {e}")
+
+        if apy_7d is None and tvl_usd is None:
+            return None, " ; ".join(errors)
+
+        return {
+            "apy_7d": apy_7d,
+            "tvl_usd": tvl_usd,
+        }, (" ; ".join(errors) if errors else None)
+    
+    async def susn_check(self):
+        metrics, err = await self.get_susn_metrics()
+        if not metrics:
+            logger.error(f"Ошибка получения sUSN metrics: {err}")
+            return
+
+        apy_7d = metrics.get("apy_7d")
+        tvl_usd = metrics.get("tvl_usd")
+
+        # пороги
+        raw_apy_min = os.getenv("SUSN_APY_7D_MIN", "10")
+        raw_tvl_min = os.getenv("SUSN_TVL_MIN", "20000000")
+
+        try:
+            apy_min = float(raw_apy_min.replace(",", "."))
+        except ValueError:
+            apy_min = 10.0
+
+        try:
+            tvl_min = float(raw_tvl_min.replace(",", "."))
+        except ValueError:
+            tvl_min = 20_000_000.0
+
+        # --- APY alert ---
+        if apy_7d is not None:
+            if self.prev_susn_apy_below is None:
+                self.prev_susn_apy_below = apy_7d < apy_min
+                if self.prev_susn_apy_below:
+                    await self.send_message(
+                        "📉 sUSN 7d APY уже ниже порога!\n"
+                        f"Текущий APY: {apy_7d:.2f}%\n"
+                        f"Порог: {apy_min:.2f}%"
+                    )
+            elif apy_7d < apy_min and self.prev_susn_apy_below is False:
+                self.prev_susn_apy_below = True
+                await self.send_message(
+                    "📉 sUSN 7d APY опустился ниже порога!\n"
+                    f"Текущий APY: {apy_7d:.2f}%\n"
+                    f"Порог: {apy_min:.2f}%"
+                )
+            elif apy_7d >= apy_min and self.prev_susn_apy_below is True:
+                self.prev_susn_apy_below = False
+                await self.send_message(
+                    "✅ sUSN 7d APY снова выше порога.\n"
+                    f"Текущий APY: {apy_7d:.2f}%\n"
+                    f"Порог: {apy_min:.2f}%"
+                )
+
+        # --- TVL alert ---
+        if tvl_usd is not None:
+            if self.prev_susn_tvl_below is None:
+                self.prev_susn_tvl_below = tvl_usd < tvl_min
+                if self.prev_susn_tvl_below:
+                    await self.send_message(
+                        "💧 TVL Noon уже ниже порога!\n"
+                        f"Текущий TVL: ${tvl_usd:,.0f}\n"
+                        f"Порог: ${tvl_min:,.0f}"
+                    )
+            elif tvl_usd < tvl_min and self.prev_susn_tvl_below is False:
+                self.prev_susn_tvl_below = True
+                await self.send_message(
+                    "💧 TVL Noon опустился ниже порога!\n"
+                    f"Текущий TVL: ${tvl_usd:,.0f}\n"
+                    f"Порог: ${tvl_min:,.0f}"
+                )
+            elif tvl_usd >= tvl_min and self.prev_susn_tvl_below is True:
+                self.prev_susn_tvl_below = False
+                await self.send_message(
+                    "✅ TVL Noon снова выше порога.\n"
+                    f"Текущий TVL: ${tvl_usd:,.0f}\n"
+                    f"Порог: ${tvl_min:,.0f}"
+                )
+    
     # --- Получение данных Gigavault ---
     async def get_gigavault_data(self):
         try:
@@ -282,18 +445,25 @@ class CryptoBot:
         prices = await self.get_prices()
         if prices:
             msg_lines = ["💰 Текущие цены:"]
-            # выводим в фиксированном порядке
+
             for symbol in ["BTC", "ETH", "AERO"]:
                 if symbol in prices:
                     msg_lines.append(f"- {symbol}: ${prices[symbol]:,.2f}")
 
-            # цена газа
-            # внутри cmd_price, после вывода монет
             gas_gwei, gerr = await self.get_eth_gas_gwei()
             if gas_gwei is not None:
                 msg_lines.append(f"- GAS: {gas_gwei:.2f} gwei")
             else:
                 msg_lines.append(f"- GAS: ошибка ({gerr})")
+
+            susn_metrics, serr = await self.get_susn_metrics()
+            if susn_metrics:
+                if susn_metrics.get("apy_7d") is not None:
+                    msg_lines.append(f"- sUSN 7d APY: {susn_metrics['apy_7d']:.2f}%")
+                if susn_metrics.get("tvl_usd") is not None:
+                    msg_lines.append(f"- Noon TVL: ${susn_metrics['tvl_usd']:,.0f}")
+            else:
+                msg_lines.append(f"- sUSN: ошибка ({serr})")
 
             await update.message.reply_text("\n".join(msg_lines))
         else:
