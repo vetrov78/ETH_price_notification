@@ -1,9 +1,7 @@
 import os
-import re
 import asyncio
 import aiohttp
 import logging
-import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -34,9 +32,9 @@ THRESHOLDS = {
     "AERO": float(os.getenv("AERO_CRITICAL_PRICE", 0.2))
 }
 
-SUSN_APP_URL = "https://app.noon.capital/"
 SUSN_METRICS_URL = "https://back.noon.capital/api/v1/protocol-metrics"
-NOON_TVL_URL = "https://api.llama.fi/tvl/noon"
+MORPHO_API_URL = "https://api.morpho.org/graphql"
+MORPHO_SUSN_USDC_MARKET_ID = "0x8924445a76b678c536df977ed9222fb0b23ee5311497dd0223fe6270bb20b4e6"
 
 # --- Настройки бота ---
 VAULT_API_URL = "https://api.prod.paradex.trade/v1/vaults"
@@ -89,8 +87,6 @@ class CryptoBot:
         self.scheduler = AsyncIOScheduler()
         self.prev_max_tvl = {'Gigavault': GIGAVAULT_START_MAX_TVL}
         self.gas_below_threshold = None
-        self.prev_susn_apy_below = None
-        self.prev_susn_tvl_below = None
 
         # локальные пороги, которые можно менять во время работы
         self.thresholds = {
@@ -119,7 +115,7 @@ class CryptoBot:
             elif symbol == "ETH" and price < self.thresholds["ETH"]:
                 await self.send_alert(symbol, price, f"упала ниже ${self.thresholds['ETH']}")
             elif symbol == "AERO" and price > self.thresholds["AERO"]:
-                await self.send_alert(symbol, price, f"выросла выше ${THRESHOLDS['AERO']}")
+                await self.send_alert(symbol, price, f"выросла выше ${self.thresholds['AERO']}")
 
     async def send_daily_prices(self):
         prices = await self.get_prices()
@@ -145,6 +141,13 @@ class CryptoBot:
             msg += f"- sUSN 7d APY: {susn_metrics['apy_7d']:.2f}%\n"
         else:
             msg += f"- sUSN 7d APY: error ({serr})\n"
+
+        # --- Morpho sUSN/USDC borrow rate
+        borrow_apy, merr = await self.get_morpho_susn_usdc_borrow_apy()
+        if borrow_apy is not None:
+            msg += f"- Morpho sUSN/USDC borrow APY: {borrow_apy * 100:.2f}%\n"
+        else:
+            msg += f"- Morpho sUSN/USDC borrow APY: error ({merr})\n"
 
         await self.send_message(msg)
 
@@ -193,78 +196,54 @@ class CryptoBot:
         except Exception as e:
             return None, f"Noon metrics exception: {e}"
     
-    async def susn_check(self):
-        metrics, err = await self.get_susn_metrics()
-        if not metrics:
-            logger.error(f"Ошибка получения sUSN metrics: {err}")
-            return
+    async def get_morpho_susn_usdc_borrow_apy(self):
+        query = """
+        query MarketRate($uniqueKey: String!, $chainId: Int!) {
+          marketByUniqueKey(uniqueKey: $uniqueKey, chainId: $chainId) {
+            state {
+              borrowApy
+            }
+          }
+        }
+        """
 
-        apy_7d = metrics.get("apy_7d")
-        tvl_usd = metrics.get("tvl_usd")
-
-        # пороги
-        raw_apy_min = os.getenv("SUSN_APY_7D_MIN", "10")
-        raw_tvl_min = os.getenv("SUSN_TVL_MIN", "20000000")
+        payload = {
+            "query": query,
+            "variables": {
+                "uniqueKey": MORPHO_SUSN_USDC_MARKET_ID,
+                "chainId": 1
+            }
+        }
 
         try:
-            apy_min = float(raw_apy_min.replace(",", "."))
-        except ValueError:
-            apy_min = 10.0
+            async with self.session.post(
+                MORPHO_API_URL,
+                json=payload,
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0"
+                },
+                timeout=30
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    return None, f"Morpho API status {resp.status}: {body[:200]}"
 
-        try:
-            tvl_min = float(raw_tvl_min.replace(",", "."))
-        except ValueError:
-            tvl_min = 20_000_000.0
+                data = await resp.json(content_type=None)
+                market = data.get("data", {}).get("marketByUniqueKey")
 
-        # --- APY alert ---
-        if apy_7d is not None:
-            if self.prev_susn_apy_below is None:
-                self.prev_susn_apy_below = apy_7d < apy_min
-                if self.prev_susn_apy_below:
-                    await self.send_message(
-                        "📉 sUSN 7d APY уже ниже порога!\n"
-                        f"Текущий APY: {apy_7d:.2f}%\n"
-                        f"Порог: {apy_min:.2f}%"
-                    )
-            elif apy_7d < apy_min and self.prev_susn_apy_below is False:
-                self.prev_susn_apy_below = True
-                await self.send_message(
-                    "📉 sUSN 7d APY опустился ниже порога!\n"
-                    f"Текущий APY: {apy_7d:.2f}%\n"
-                    f"Порог: {apy_min:.2f}%"
-                )
-            elif apy_7d >= apy_min and self.prev_susn_apy_below is True:
-                self.prev_susn_apy_below = False
-                await self.send_message(
-                    "✅ sUSN 7d APY снова выше порога.\n"
-                    f"Текущий APY: {apy_7d:.2f}%\n"
-                    f"Порог: {apy_min:.2f}%"
-                )
+                if not market:
+                    return None, f"Unexpected Morpho payload: {data!r}"
 
-        # --- TVL alert ---
-        if tvl_usd is not None:
-            if self.prev_susn_tvl_below is None:
-                self.prev_susn_tvl_below = tvl_usd < tvl_min
-                if self.prev_susn_tvl_below:
-                    await self.send_message(
-                        "💧 TVL Noon уже ниже порога!\n"
-                        f"Текущий TVL: ${tvl_usd:,.0f}\n"
-                        f"Порог: ${tvl_min:,.0f}"
-                    )
-            elif tvl_usd < tvl_min and self.prev_susn_tvl_below is False:
-                self.prev_susn_tvl_below = True
-                await self.send_message(
-                    "💧 TVL Noon опустился ниже порога!\n"
-                    f"Текущий TVL: ${tvl_usd:,.0f}\n"
-                    f"Порог: ${tvl_min:,.0f}"
-                )
-            elif tvl_usd >= tvl_min and self.prev_susn_tvl_below is True:
-                self.prev_susn_tvl_below = False
-                await self.send_message(
-                    "✅ TVL Noon снова выше порога.\n"
-                    f"Текущий TVL: ${tvl_usd:,.0f}\n"
-                    f"Порог: ${tvl_min:,.0f}"
-                )
+                borrow_apy = market.get("state", {}).get("borrowApy")
+                if borrow_apy is None:
+                    return None, f"borrowApy not found: {data!r}"
+
+                return float(borrow_apy), None
+
+        except Exception as e:
+            return None, f"Morpho API exception: {e}"
     
     # --- Получение данных Gigavault ---
     async def get_gigavault_data(self):
@@ -427,12 +406,20 @@ class CryptoBot:
                 msg_lines.append(f"- GAS: {gas_gwei:.2f} gwei")
             else:
                 msg_lines.append(f"- GAS: ошибка ({gerr})")
-
+            
+            # get sUSN 7d APR
             susn_metrics, serr = await self.get_susn_metrics()
             if susn_metrics and susn_metrics.get("apy_7d") is not None:
                 msg_lines.append(f"- sUSN 7d APY: {susn_metrics['apy_7d']:.2f}%")
             else:
                 msg_lines.append(f"- sUSN 7d APY: error ({serr})")
+
+            # get Morpho sUSN/USDC borrow rate
+            borrow_apy, merr = await self.get_morpho_susn_usdc_borrow_apy()
+            if borrow_apy is not None:
+                msg_lines.append(f"- Morpho sUSN/USDC borrow APY: {borrow_apy * 100:.2f}%")
+            else:
+                msg_lines.append(f"- Morpho sUSN/USDC borrow APY: error ({merr})")
 
             await update.message.reply_text("\n".join(msg_lines))
         else:
