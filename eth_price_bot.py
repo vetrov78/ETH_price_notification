@@ -35,7 +35,8 @@ THRESHOLDS = {
 }
 
 SUSN_APP_URL = "https://app.noon.capital/"
-NOON_TVL_URL = "https://defillama.com/protocol/noon"
+SUSN_METRICS_URL = "https://back.noon.capital/api/v1/protocol-metrics"
+NOON_TVL_URL = "https://api.llama.fi/tvl/noon"
 
 # --- Настройки бота ---
 VAULT_API_URL = "https://api.prod.paradex.trade/v1/vaults"
@@ -140,91 +141,57 @@ class CryptoBot:
 
         # --- sUSN ---
         susn_metrics, serr = await self.get_susn_metrics()
-        if susn_metrics:
-            if susn_metrics.get("apy_7d") is not None:
-                msg += f"- sUSN 7d APY: {susn_metrics['apy_7d']:.2f}%\n"
-            if susn_metrics.get("tvl_usd") is not None:
-                msg += f"- Noon TVL: ${susn_metrics['tvl_usd']:,.0f}\n"
+        if susn_metrics and susn_metrics.get("apy_7d") is not None:
+            msg += f"- sUSN 7d APY: {susn_metrics['apy_7d']:.2f}%\n"
         else:
-            msg += f"- sUSN: ошибка ({serr})\n"
+            msg += f"- sUSN 7d APY: error ({serr})\n"
 
         await self.send_message(msg)
-        
+
     async def get_susn_metrics(self):
-        apy_7d = None
-        tvl_usd = None
-        errors = []
-
-        # --- sUSN 7D APY с Noon app ---
         try:
             async with self.session.get(
-                SUSN_APP_URL,
-                headers={"User-Agent": "Mozilla/5.0"},
+                SUSN_METRICS_URL,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "Mozilla/5.0"
+                },
                 timeout=30
             ) as resp:
                 if resp.status != 200:
-                    errors.append(f"Noon app status {resp.status}")
-                else:
-                    html = await resp.text()
+                    body = await resp.text()
+                    return None, f"Noon metrics status {resp.status}: {body[:200]}"
 
-                    patterns = [
-                        r"APY,\s*7D[^0-9]{0,40}([0-9]+(?:\.[0-9]+)?)%",
-                        r"7D[^0-9]{0,20}APY[^0-9]{0,40}([0-9]+(?:\.[0-9]+)?)%",
-                        r"sUSN[^0-9]{0,40}([0-9]+(?:\.[0-9]+)?)%[^%]{0,80}APY,\s*7D"
-                    ]
+                data = await resp.json(content_type=None)
 
-                    for pattern in patterns:
-                        m = re.search(pattern, html, flags=re.IGNORECASE | re.DOTALL)
-                        if m:
-                            apy_7d = float(m.group(1))
-                            break
+                apy_7d = None
 
-                    if apy_7d is None:
-                        errors.append("Noon app 7D APY not found")
+                # 1) сначала пробуем текущее поле apy
+                if isinstance(data.get("apy"), (str, int, float)):
+                    try:
+                        apy_7d = float(data["apy"])
+                    except (TypeError, ValueError):
+                        pass
+
+                # 2) fallback: берём последнее значение из apyTimeSeries
+                if apy_7d is None and isinstance(data.get("apyTimeSeries"), dict):
+                    ts = data["apyTimeSeries"]
+                    if ts:
+                        last_date = sorted(ts.keys())[-1]
+                        try:
+                            apy_7d = float(ts[last_date])
+                        except (TypeError, ValueError):
+                            pass
+
+                if apy_7d is None:
+                    return None, f"Unexpected Noon payload: {data!r}"
+
+                return {
+                    "apy_7d": apy_7d
+                }, None
+
         except Exception as e:
-            errors.append(f"Noon app exception: {e}")
-
-        # --- TVL с DefiLlama страницы Noon ---
-        try:
-            async with self.session.get(
-                NOON_TVL_URL,
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=30
-            ) as resp:
-                if resp.status != 200:
-                    errors.append(f"DefiLlama status {resp.status}")
-                else:
-                    html = await resp.text()
-
-                    m = re.search(
-                        r"Total Value Locked\s*\$([0-9]+(?:\.[0-9]+)?)\s*([mbk]?)",
-                        html,
-                        flags=re.IGNORECASE
-                    )
-                    if m:
-                        value = float(m.group(1))
-                        suffix = m.group(2).lower()
-
-                        if suffix == "b":
-                            tvl_usd = value * 1_000_000_000
-                        elif suffix == "m":
-                            tvl_usd = value * 1_000_000
-                        elif suffix == "k":
-                            tvl_usd = value * 1_000
-                        else:
-                            tvl_usd = value
-                    else:
-                        errors.append("DefiLlama TVL not found")
-        except Exception as e:
-            errors.append(f"DefiLlama exception: {e}")
-
-        if apy_7d is None and tvl_usd is None:
-            return None, " ; ".join(errors)
-
-        return {
-            "apy_7d": apy_7d,
-            "tvl_usd": tvl_usd,
-        }, (" ; ".join(errors) if errors else None)
+            return None, f"Noon metrics exception: {e}"
     
     async def susn_check(self):
         metrics, err = await self.get_susn_metrics()
@@ -435,11 +402,16 @@ class CryptoBot:
         await self.send_message(msg)
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
+        text = (
             "🤖 Бот для мониторинга криптовалют\n"
             f"Авто-проверка каждые {CHECK_INTERVAL} секунд.\n"
             "Команда /price для текущих цен."
         )
+
+        if update.message:
+            await update.message.reply_text(text)
+        elif update.effective_chat:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=text)
 
     async def cmd_price(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         prices = await self.get_prices()
@@ -457,13 +429,10 @@ class CryptoBot:
                 msg_lines.append(f"- GAS: ошибка ({gerr})")
 
             susn_metrics, serr = await self.get_susn_metrics()
-            if susn_metrics:
-                if susn_metrics.get("apy_7d") is not None:
-                    msg_lines.append(f"- sUSN 7d APY: {susn_metrics['apy_7d']:.2f}%")
-                if susn_metrics.get("tvl_usd") is not None:
-                    msg_lines.append(f"- Noon TVL: ${susn_metrics['tvl_usd']:,.0f}")
+            if susn_metrics and susn_metrics.get("apy_7d") is not None:
+                msg_lines.append(f"- sUSN 7d APY: {susn_metrics['apy_7d']:.2f}%")
             else:
-                msg_lines.append(f"- sUSN: ошибка ({serr})")
+                msg_lines.append(f"- sUSN 7d APY: error ({serr})")
 
             await update.message.reply_text("\n".join(msg_lines))
         else:
