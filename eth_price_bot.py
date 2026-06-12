@@ -195,22 +195,23 @@ class CryptoBot:
 
         except Exception as e:
             return None, f"Noon metrics exception: {e}"
-    
+
     async def get_morpho_susn_usdc_borrow_apy(self):
         query = """
-        query MarketRate($uniqueKey: String!, $chainId: Int!) {
-          marketByUniqueKey(uniqueKey: $uniqueKey, chainId: $chainId) {
+        query MarketRate($marketId: String!, $chainId: Int!) {
+        marketById(marketId: $marketId, chainId: $chainId) {
+            marketId
             state {
-              borrowApy
+            borrowApy
             }
-          }
+        }
         }
         """
 
         payload = {
             "query": query,
             "variables": {
-                "uniqueKey": MORPHO_SUSN_USDC_MARKET_ID,
+                "marketId": MORPHO_SUSN_USDC_MARKET_ID,
                 "chainId": 1
             }
         }
@@ -231,7 +232,11 @@ class CryptoBot:
                     return None, f"Morpho API status {resp.status}: {body[:200]}"
 
                 data = await resp.json(content_type=None)
-                market = data.get("data", {}).get("marketByUniqueKey")
+
+                if data.get("errors"):
+                    return None, f"Morpho API errors: {data['errors']}"
+
+                market = data.get("data", {}).get("marketById")
 
                 if not market:
                     return None, f"Unexpected Morpho payload: {data!r}"
@@ -244,7 +249,7 @@ class CryptoBot:
 
         except Exception as e:
             return None, f"Morpho API exception: {e}"
-    
+
     # --- Получение данных Gigavault ---
     async def get_gigavault_data(self):
         try:
