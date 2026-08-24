@@ -52,14 +52,6 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 300))  # в секундах
 DAILY_HOUR = int(os.getenv("DAILY_REPORT_HOUR", 9))
 DAILY_MINUTE = int(os.getenv("DAILY_REPORT_MINUTE", 0))
 
-try:
-    GIGAVAULT_START_MAX_TVL = float(GIGAVAULT_START_MAX_TVL_RAW.replace(",", "."))
-except ValueError:
-    logger.error(
-        f"Некорректное значение GIGAVAULT_START_MAX_TVL='{GIGAVAULT_START_MAX_TVL_RAW}', использую 90000000"
-    )
-    GIGAVAULT_START_MAX_TVL = 90000000.0
-
 def update_env_value(env_path: str, key: str, value: str):
         lines = []
         found = False
@@ -86,7 +78,6 @@ class CryptoBot:
         self.app = app
         self.chat_id = chat_id
         self.scheduler = AsyncIOScheduler()
-        self.prev_max_tvl = {'Gigavault': GIGAVAULT_START_MAX_TVL}
         self.gas_below_threshold = None
 
         # локальные пороги, которые можно менять во время работы
@@ -236,45 +227,6 @@ class CryptoBot:
 
         except Exception as e:
             return None, f"Morpho API exception: {e}"
-
-    # --- Получение данных Gigavault ---
-    async def get_gigavault_data(self):
-        try:
-            async with self.session.get(
-                VAULT_API_URL,
-                headers={"Accept": "application/json"},
-                timeout=30
-            ) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    logger.error(f"Gigavault API status={resp.status}, body={body[:200]}")
-                    return None
-
-                return await resp.json(content_type=None)
-
-        except Exception as e:
-            logger.error(f"Ошибка при получении данных Gigavault: {e}")
-            return None
-
-    async def check_gigavault(self):
-        vaults = await self.get_gigavault_data()
-
-        for vault in vaults['results']:
-            # Проверяем название именно в объекте
-            if vault.get('name') == "Gigavault":
-                max_tvl = vault.get('max_tvl', 0)
-                prev = self.prev_max_tvl.get("Gigavault", 0)
-
-                if max_tvl > prev:
-                    free_space = max_tvl - prev
-                    msg = f"📢 Gigavault max TVL увеличен!\n" \
-                        f"Было: {prev:,}\n" \
-                        f"Стало: {max_tvl:,}\n" \
-                        f"Доступное место появилось: {free_space:,}"
-                    await self.send_message(msg)
-
-                # Обновляем сохранённое значение
-                self.prev_max_tvl["Gigavault"] = max_tvl
 
     # --- Получение информации о газе
     async def get_eth_gas_gwei(self):
@@ -454,7 +406,6 @@ class CryptoBot:
         while True:
             try:
                 await self.price_check()
-                await self.check_gigavault()
                 await self.gas_check()
                 await asyncio.sleep(CHECK_INTERVAL)
             except Exception as e:
@@ -486,7 +437,7 @@ async def main():
         # --- Уведомление о запуске ---
         await bot.send_message("✅ Бот запущен")
 
-        # --- Фоновая проверка цен и Gigavault ---
+        # --- Фоновая проверка цен ---
         asyncio.create_task(bot.run_checks())
 
         # --- Планировщик утреннего отчёта ---
