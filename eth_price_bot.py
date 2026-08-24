@@ -135,20 +135,6 @@ class CryptoBot:
         else:
             msg += f"- GAS: ошибка ({gerr})\n"
 
-        # --- sUSN ---
-        susn_metrics, serr = await self.get_susn_metrics()
-        if susn_metrics and susn_metrics.get("apy_7d") is not None:
-            msg += f"- sUSN 7d APY: {susn_metrics['apy_7d']:.2f}%\n"
-        else:
-            msg += f"- sUSN 7d APY: error ({serr})\n"
-
-        # --- Morpho sUSN/USDC borrow rate
-        borrow_apy, merr = await self.get_morpho_susn_usdc_borrow_apy()
-        if borrow_apy is not None:
-            msg += f"- Morpho sUSN/USDC borrow APY: {borrow_apy * 100:.2f}%\n"
-        else:
-            msg += f"- Morpho sUSN/USDC borrow APY: error ({merr})\n"
-
         await self.send_message(msg)
 
     async def get_susn_metrics(self):
@@ -411,20 +397,6 @@ class CryptoBot:
                 msg_lines.append(f"- GAS: {gas_gwei:.2f} gwei")
             else:
                 msg_lines.append(f"- GAS: ошибка ({gerr})")
-            
-            # get sUSN 7d APR
-            susn_metrics, serr = await self.get_susn_metrics()
-            if susn_metrics and susn_metrics.get("apy_7d") is not None:
-                msg_lines.append(f"- sUSN 7d APY: {susn_metrics['apy_7d']:.2f}%")
-            else:
-                msg_lines.append(f"- sUSN 7d APY: error ({serr})")
-
-            # get Morpho sUSN/USDC borrow rate
-            borrow_apy, merr = await self.get_morpho_susn_usdc_borrow_apy()
-            if borrow_apy is not None:
-                msg_lines.append(f"- Morpho sUSN/USDC borrow APY: {borrow_apy * 100:.2f}%")
-            else:
-                msg_lines.append(f"- Morpho sUSN/USDC borrow APY: error ({merr})")
 
             await update.message.reply_text("\n".join(msg_lines))
         else:
