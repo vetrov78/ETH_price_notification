@@ -23,8 +23,11 @@ COINS = {
     "BTC": "bitcoin",
     "ETH": "ethereum",
     "AERO": "aerodrome-finance",
-
+    "XAUT": "tether-gold",
+    "APXUSD": "apxusd",
 }
+
+PRICE_SYMBOLS = ["BTC", "ETH", "AERO", "XAUT", "APXUSD"]
 
 THRESHOLDS = {
     "BTC": float(os.getenv("BTC_CRITICAL_PRICE", 99000)),   # ниже этой цены → тревога
@@ -49,8 +52,6 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 300))  # в секундах
 DAILY_HOUR = int(os.getenv("DAILY_REPORT_HOUR", 9))
 DAILY_MINUTE = int(os.getenv("DAILY_REPORT_MINUTE", 0))
 
-# --- Gigavault ---
-GIGAVAULT_START_MAX_TVL_RAW = os.getenv("GIGAVAULT_START_MAX_TVL", "90000000")
 try:
     GIGAVAULT_START_MAX_TVL = float(GIGAVAULT_START_MAX_TVL_RAW.replace(",", "."))
 except ValueError:
