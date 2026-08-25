@@ -406,7 +406,6 @@ class CryptoBot:
         while True:
             try:
                 await self.price_check()
-                await self.gas_check()
                 await asyncio.sleep(CHECK_INTERVAL)
             except Exception as e:
                 logger.error(f"Ошибка в цикле проверки: {e}")
