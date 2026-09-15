@@ -35,12 +35,13 @@ THRESHOLDS = {
     "AERO": float(os.getenv("AERO_CRITICAL_PRICE", 0.2))
 }
 
-SUSN_METRICS_URL = "https://back.noon.capital/api/v1/protocol-metrics"
 MORPHO_API_URL = "https://api.morpho.org/graphql"
 MORPHO_SUSN_USDC_MARKET_ID = "0x8924445a76b678c536df977ed9222fb0b23ee5311497dd0223fe6270bb20b4e6"
 
+FX_API_URL = "https://open.er-api.com/v6/latest/USD"
+
 # --- Настройки бота ---
-VAULT_API_URL = "https://api.prod.paradex.trade/v1/vaults"
+SUSN_METRICS_URL = "https://back.noon.capital/api/v1/protocol-metrics"
 
 # Несколько публичных RPC для фолбэка
 ETH_RPC_URLS = os.getenv(
@@ -119,6 +120,12 @@ class CryptoBot:
                     msg += f"- {symbol}: ${prices[symbol]:,.2f}\n"
         else:
             msg += "— Не удалось получить цены монет\n"
+
+        usd_brl, ferr = await self.get_usd_brl_rate()
+        if usd_brl is not None:
+            msg += f"- USD/BRL: R$ {usd_brl:.4f}\n"
+        else:
+            msg += f"- USD/BRL: error ({ferr})\n"
 
         # --- GAS ---
         gas_gwei, gerr = await self.get_eth_gas_gwei()
@@ -227,6 +234,31 @@ class CryptoBot:
 
         except Exception as e:
             return None, f"Morpho API exception: {e}"
+
+    async def get_usd_brl_rate(self):
+        try:
+            async with self.session.get(
+                FX_API_URL,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "Mozilla/5.0"
+                },
+                timeout=30
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    return None, f"FX API status {resp.status}: {body[:200]}"
+
+                data = await resp.json(content_type=None)
+                rate = data.get("rates", {}).get("BRL")
+
+                if rate is None:
+                    return None, f"BRL rate not found: {data!r}"
+
+                return float(rate), None
+
+        except Exception as e:
+            return None, f"FX API exception: {e}"
 
     # --- Получение информации о газе
     async def get_eth_gas_gwei(self):
@@ -344,6 +376,12 @@ class CryptoBot:
             for symbol in ["BTC", "ETH", "AERO"]:
                 if symbol in prices:
                     msg_lines.append(f"- {symbol}: ${prices[symbol]:,.2f}")
+
+            usd_brl, ferr = await self.get_usd_brl_rate()
+            if usd_brl is not None:
+                msg_lines.append(f"- USD/BRL: R$ {usd_brl:.4f}")
+            else:
+                msg_lines.append(f"- USD/BRL: error ({ferr})")
 
             gas_gwei, gerr = await self.get_eth_gas_gwei()
             if gas_gwei is not None:
