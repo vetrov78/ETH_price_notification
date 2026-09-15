@@ -30,9 +30,10 @@ COINS = {
 PRICE_SYMBOLS = ["BTC", "ETH", "AERO", "XAUT", "APXUSD"]
 
 THRESHOLDS = {
-    "BTC": float(os.getenv("BTC_CRITICAL_PRICE", 99000)),   # ниже этой цены → тревога
-    "ETH": float(os.getenv("ETH_CRITICAL_PRICE", 3300)),
-    "AERO": float(os.getenv("AERO_CRITICAL_PRICE", 0.2))
+    "BTC": "BTC_CRITICAL_PRICE",
+    "ETH": "ETH_CRITICAL_PRICE",
+    "AERO": "AERO_CRITICAL_PRICE",
+    "USD_BRL": "USD_BRL_CRITICAL_RATE",
 }
 
 MORPHO_API_URL = "https://api.morpho.org/graphql"
@@ -80,12 +81,14 @@ class CryptoBot:
         self.chat_id = chat_id
         self.scheduler = AsyncIOScheduler()
         self.gas_below_threshold = None
+        self.usd_brl_above_threshold = None
 
         # локальные пороги, которые можно менять во время работы
         self.thresholds = {
             "BTC": THRESHOLDS["BTC"],
             "ETH": THRESHOLDS["ETH"],
             "AERO": THRESHOLDS["AERO"],
+            "USD_BRL": float(os.getenv("USD_BRL_CRITICAL_RATE", "5.20").replace(",", ".")),
         }
 
     # --- Крипто ---
@@ -260,6 +263,36 @@ class CryptoBot:
         except Exception as e:
             return None, f"FX API exception: {e}"
 
+    async def usd_brl_check(self):
+        usd_brl, err = await self.get_usd_brl_rate()
+        if usd_brl is None:
+            logger.error(f"Ошибка получения USD/BRL: {err}")
+            return
+
+        raw_critical = os.getenv("USD_BRL_CRITICAL_RATE", "5.50")
+        try:
+            critical = float(raw_critical.replace(",", "."))
+        except ValueError:
+            logger.error(f"Некорректное значение USD_BRL_CRITICAL_RATE='{raw_critical}', использую 5.50")
+            critical = self.thresholds["USD_BRL"]
+
+        logger.info(
+            f"usd_brl_check: rate={usd_brl:.4f}, critical={critical:.4f}, "
+            f"state={self.usd_brl_above_threshold}"
+        )
+
+        if usd_brl <= critical:
+            self.usd_brl_above_threshold = False
+            return
+
+        if usd_brl > critical and self.usd_brl_above_threshold is not True:
+            self.usd_brl_above_threshold = True
+            await self.send_message(
+                "🚨 USD/BRL превысил порог!\n"
+                f"Текущий курс: R$ {usd_brl:.4f}\n"
+                f"Пороговое значение: R$ {critical:.4f}"
+            )
+
     # --- Получение информации о газе
     async def get_eth_gas_gwei(self):
         """Возвращает (gwei, None) или (None, error). Пробует несколько RPC по очереди."""
@@ -424,7 +457,7 @@ class CryptoBot:
 
         old_value = self.thresholds[symbol]
         self.thresholds[symbol] = new_value
-        env_key = f"{symbol}_CRITICAL_PRICE"
+        env_key = THRESHOLDS[symbol]
         update_env_value("config.env", env_key, value_str)
         os.environ[env_key] = value_str  # опционально, чтобы getenv тоже видел новое значение в этом процессе
 
