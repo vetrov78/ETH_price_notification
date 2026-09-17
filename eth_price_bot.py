@@ -2,6 +2,7 @@ import os
 import asyncio
 import aiohttp
 import logging
+import math
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -39,7 +40,8 @@ THRESHOLDS = {
 MORPHO_API_URL = "https://api.morpho.org/graphql"
 MORPHO_SUSN_USDC_MARKET_ID = "0x8924445a76b678c536df977ed9222fb0b23ee5311497dd0223fe6270bb20b4e6"
 
-FX_API_URL = "https://open.er-api.com/v6/latest/USD"
+BYBIT_TICKERS_URL = "https://api.bybit.com/v5/market/tickers"
+BYBIT_BRL_SYMBOL = "USDTBRL"
 
 # --- Настройки бота ---
 SUSN_METRICS_URL = "https://back.noon.capital/api/v1/protocol-metrics"
@@ -126,9 +128,9 @@ class CryptoBot:
 
         usd_brl, ferr = await self.get_usd_brl_rate()
         if usd_brl is not None:
-            msg += f"- USD/BRL: R$ {usd_brl:.4f}\n"
+            msg += f"- USDT/BRL (Bybit Spot): R$ {usd_brl:.4f}\n"
         else:
-            msg += f"- USD/BRL: error ({ferr})\n"
+            msg += f"- USDT/BRL (Bybit Spot): error ({ferr})\n"
 
         # --- GAS ---
         gas_gwei, gerr = await self.get_eth_gas_gwei()
@@ -239,9 +241,14 @@ class CryptoBot:
             return None, f"Morpho API exception: {e}"
 
     async def get_usd_brl_rate(self):
+        """Возвращает BRL за 1 USDT по последней сделке на Bybit Spot.
+
+        Имя метода сохранено для совместимости с настройками USD_BRL.
+        """
         try:
             async with self.session.get(
-                FX_API_URL,
+                BYBIT_TICKERS_URL,
+                params={"category": "spot", "symbol": BYBIT_BRL_SYMBOL},
                 headers={
                     "Accept": "application/json",
                     "User-Agent": "Mozilla/5.0"
@@ -250,23 +257,36 @@ class CryptoBot:
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
-                    return None, f"FX API status {resp.status}: {body[:200]}"
+                    return None, f"Bybit API status {resp.status}: {body[:200]}"
 
                 data = await resp.json(content_type=None)
-                rate = data.get("rates", {}).get("BRL")
+                if data.get("retCode") != 0:
+                    return None, f"Bybit API error {data.get('retCode')}: {data.get('retMsg')}"
 
-                if rate is None:
-                    return None, f"BRL rate not found: {data!r}"
+                tickers = data.get("result", {}).get("list", [])
+                ticker = next(
+                    (item for item in tickers if item.get("symbol") == BYBIT_BRL_SYMBOL),
+                    None
+                )
+                if ticker is None:
+                    return None, f"Bybit Spot ticker {BYBIT_BRL_SYMBOL} not found"
 
-                return float(rate), None
+                try:
+                    rate = float(ticker.get("lastPrice"))
+                except (TypeError, ValueError):
+                    return None, f"Invalid Bybit {BYBIT_BRL_SYMBOL} lastPrice"
+                if not math.isfinite(rate) or rate <= 0:
+                    return None, f"Invalid Bybit {BYBIT_BRL_SYMBOL} lastPrice: {rate}"
+
+                return rate, None
 
         except Exception as e:
-            return None, f"FX API exception: {e}"
+            return None, f"Bybit API exception: {e}"
 
     async def usd_brl_check(self):
         usd_brl, err = await self.get_usd_brl_rate()
         if usd_brl is None:
-            logger.error(f"Ошибка получения USD/BRL: {err}")
+            logger.error(f"Ошибка получения USDT/BRL (Bybit Spot): {err}")
             return
 
         raw_critical = os.getenv("USD_BRL_CRITICAL_RATE", "5.50")
@@ -288,7 +308,7 @@ class CryptoBot:
         if usd_brl > critical and self.usd_brl_above_threshold is not True:
             self.usd_brl_above_threshold = True
             await self.send_message(
-                "🚨 USD/BRL превысил порог!\n"
+                "🚨 USDT/BRL (Bybit Spot) превысил порог!\n"
                 f"Текущий курс: R$ {usd_brl:.4f}\n"
                 f"Пороговое значение: R$ {critical:.4f}"
             )
@@ -412,9 +432,9 @@ class CryptoBot:
 
             usd_brl, ferr = await self.get_usd_brl_rate()
             if usd_brl is not None:
-                msg_lines.append(f"- USD/BRL: R$ {usd_brl:.4f}")
+                msg_lines.append(f"- USDT/BRL (Bybit Spot): R$ {usd_brl:.4f}")
             else:
-                msg_lines.append(f"- USD/BRL: error ({ferr})")
+                msg_lines.append(f"- USDT/BRL (Bybit Spot): error ({ferr})")
 
             gas_gwei, gerr = await self.get_eth_gas_gwei()
             if gas_gwei is not None:
