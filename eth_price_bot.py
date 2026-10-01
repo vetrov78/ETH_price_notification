@@ -43,6 +43,10 @@ MORPHO_SUSN_USDC_MARKET_ID = "0x8924445a76b678c536df977ed9222fb0b23ee5311497dd02
 BYBIT_TICKERS_URL = "https://api.bybit.com/v5/market/tickers"
 BYBIT_BRL_SYMBOL = "USDTBRL"
 
+HYPERITHM_VAULT_ADDRESS = "0xD0943c76ee287793559c1dF82E5B2B858Dd01Ef3"
+HYPERITHM_VAULT_URL = f"https://yield.accountable.capital/vaults/{HYPERITHM_VAULT_ADDRESS}"
+ACCOUNTABLE_LOAN_URL = "https://yield.accountable.capital/api/loan/address"
+
 # --- Настройки бота ---
 SUSN_METRICS_URL = "https://back.noon.capital/api/v1/protocol-metrics"
 
@@ -84,6 +88,7 @@ class CryptoBot:
         self.scheduler = AsyncIOScheduler()
         self.gas_below_threshold = None
         self.usd_brl_above_threshold = None
+        self.hyperithm_vault_accepting_deposits = None
 
         # локальные пороги, которые можно менять во время работы
         self.thresholds = {
@@ -313,6 +318,86 @@ class CryptoBot:
                 f"Пороговое значение: R$ {critical:.4f}"
             )
 
+    async def get_hyperithm_vault_status(self):
+        url = f"{ACCOUNTABLE_LOAN_URL}/{HYPERITHM_VAULT_ADDRESS}"
+        try:
+            async with self.session.get(url, timeout=30) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    return None, f"Accountable API status {resp.status}: {body[:200]}"
+
+                data = await resp.json(content_type=None)
+                loan = data.get("loan")
+                computed = data.get("loan_computed")
+                on_chain = data.get("on_chain_loan")
+                if not all(isinstance(item, dict) for item in (loan, computed, on_chain)):
+                    return None, "Unexpected Accountable API payload: missing loan data"
+
+                vault_loan = on_chain.get("loan")
+                vault_asset = on_chain.get("vault_asset")
+                if not isinstance(vault_loan, dict) or not isinstance(vault_asset, dict):
+                    return None, "Unexpected Accountable API payload: missing on-chain capacity data"
+
+                loan_terms = vault_loan.get("loan")
+                if not isinstance(loan_terms, dict):
+                    return None, "Unexpected Accountable API payload: missing loan terms"
+
+                raw_capacity = loan_terms.get("maxCapacity")
+                decimals = vault_asset.get("decimals")
+                deposits_usd = computed.get("tvl_in_usd")
+                if (
+                    isinstance(raw_capacity, bool)
+                    or not isinstance(raw_capacity, (int, float))
+                    or isinstance(decimals, bool)
+                    or not isinstance(decimals, int)
+                    or not 0 <= decimals <= 36
+                    or isinstance(deposits_usd, bool)
+                    or not isinstance(deposits_usd, (int, float))
+                ):
+                    return None, "Unexpected Accountable API payload: invalid capacity or deposit values"
+
+                capacity_usdc = raw_capacity / (10 ** decimals)
+                if (
+                    not math.isfinite(capacity_usdc)
+                    or not math.isfinite(deposits_usd)
+                    or capacity_usdc < 0
+                    or deposits_usd < 0
+                ):
+                    return None, "Unexpected Accountable API payload: non-finite or negative capacity values"
+
+                accepts_deposits = (
+                    loan.get("active") is True
+                    and computed.get("can_deposit") is True
+                    and on_chain.get("paused") is not True
+                    and deposits_usd < capacity_usdc
+                )
+                return {
+                    "accepts_deposits": accepts_deposits,
+                    "capacity_usdc": capacity_usdc,
+                    "deposits_usd": deposits_usd,
+                    "available_usdc": max(0.0, capacity_usdc - deposits_usd),
+                }, None
+        except Exception as e:
+            return None, f"Accountable API exception: {e}"
+
+    async def hyperithm_vault_check(self):
+        status, err = await self.get_hyperithm_vault_status()
+        if status is None:
+            logger.error(f"Ошибка проверки Hyperithm vault: {err}")
+            return
+
+        accepts_deposits = status["accepts_deposits"]
+        if accepts_deposits and self.hyperithm_vault_accepting_deposits is not True:
+            await self.send_message(
+                "🟢 Hyperithm Delta Neutral Vault сейчас принимает новые депозиты.\n"
+                f"Свободная вместимость: ${status['available_usdc']:,.2f} USDC\n"
+                f"Депозиты / лимит: ${status['deposits_usd']:,.2f} / "
+                f"${status['capacity_usdc']:,.2f} USDC\n"
+                f"{HYPERITHM_VAULT_URL}"
+            )
+
+        self.hyperithm_vault_accepting_deposits = accepts_deposits
+
     # --- Получение информации о газе
     async def get_eth_gas_gwei(self):
         """Возвращает (gwei, None) или (None, error). Пробует несколько RPC по очереди."""
@@ -423,9 +508,9 @@ class CryptoBot:
 
     async def cmd_price(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         prices = await self.get_prices()
-        if prices:
-            msg_lines = ["💰 Текущие цены:"]
+        msg_lines = ["💰 Текущие цены:"]
 
+        if prices:
             for symbol in ["BTC", "ETH", "AERO"]:
                 if symbol in prices:
                     msg_lines.append(f"- {symbol}: ${prices[symbol]:,.2f}")
@@ -436,15 +521,25 @@ class CryptoBot:
             else:
                 msg_lines.append(f"- USDT/BRL (Bybit Spot): error ({ferr})")
 
-            gas_gwei, gerr = await self.get_eth_gas_gwei()
-            if gas_gwei is not None:
-                msg_lines.append(f"- GAS: {gas_gwei:.2f} gwei")
-            else:
-                msg_lines.append(f"- GAS: ошибка ({gerr})")
-
-            await update.message.reply_text("\n".join(msg_lines))
         else:
-            await update.message.reply_text("Не удалось получить цены")
+            msg_lines.append("- Не удалось получить цены монет")
+
+        vault_status, vault_error = await self.get_hyperithm_vault_status()
+        if vault_status is None:
+            msg_lines.append(f"- HDNV(dep/lim): ошибка проверки ({vault_error})")
+        else:
+            msg_lines.append(
+                f"- HDNV(dep/lim): ${vault_status['deposits_usd'] / 1_000_000:.2f}M/"
+                f"${vault_status['capacity_usdc'] / 1_000_000:.2f}M"
+            )
+
+        gas_gwei, gerr = await self.get_eth_gas_gwei()
+        if gas_gwei is not None:
+            msg_lines.append(f"- GAS: {gas_gwei:.2f} gwei")
+        else:
+            msg_lines.append(f"- GAS: ошибка ({gerr})")
+
+        await update.message.reply_text("\n".join(msg_lines))
 
     async def cmd_set(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда: /set <COIN> <VALUE>
@@ -497,10 +592,16 @@ class CryptoBot:
         while True:
             try:
                 await self.price_check()
-                await asyncio.sleep(CHECK_INTERVAL)
             except Exception as e:
-                logger.error(f"Ошибка в цикле проверки: {e}")
+                logger.error(f"Ошибка проверки цен: {e}")
                 await asyncio.sleep(60)
+
+            try:
+                await self.hyperithm_vault_check()
+            except Exception as e:
+                logger.error(f"Ошибка проверки Hyperithm vault: {e}")
+
+            await asyncio.sleep(CHECK_INTERVAL)
 
     async def shutdown(self):
         self.scheduler.shutdown()
