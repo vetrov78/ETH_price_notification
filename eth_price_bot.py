@@ -3,8 +3,8 @@ import asyncio
 import aiohttp
 import logging
 import math
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import ReplyKeyboardMarkup, Update
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 
@@ -60,6 +60,16 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 300))  # в секундах
 DAILY_HOUR = int(os.getenv("DAILY_REPORT_HOUR", 9))
 DAILY_MINUTE = int(os.getenv("DAILY_REPORT_MINUTE", 0))
 
+BUTTON_PRICE = "💰 Цены"
+BUTTON_THRESHOLDS = "🎯 Пороги"
+
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [[BUTTON_PRICE, BUTTON_THRESHOLDS]],
+    resize_keyboard=True,
+    is_persistent=True,
+    input_field_placeholder="Выберите действие",
+)
+
 def update_env_value(env_path: str, key: str, value: str):
         lines = []
         found = False
@@ -92,9 +102,9 @@ class CryptoBot:
 
         # локальные пороги, которые можно менять во время работы
         self.thresholds = {
-            "BTC": THRESHOLDS["BTC"],
-            "ETH": THRESHOLDS["ETH"],
-            "AERO": THRESHOLDS["AERO"],
+            "BTC": float(os.environ[THRESHOLDS["BTC"]].replace(",", ".")),
+            "ETH": float(os.environ[THRESHOLDS["ETH"]].replace(",", ".")),
+            "AERO": float(os.environ[THRESHOLDS["AERO"]].replace(",", ".")),
             "USD_BRL": float(os.getenv("USD_BRL_CRITICAL_RATE", "5.20").replace(",", ".")),
         }
 
@@ -498,13 +508,15 @@ class CryptoBot:
         text = (
             "🤖 Бот для мониторинга криптовалют\n"
             f"Авто-проверка каждые {CHECK_INTERVAL} секунд.\n"
-            "Команда /price для текущих цен."
+            "Выберите действие с помощью кнопок ниже."
         )
 
         if update.message:
-            await update.message.reply_text(text)
+            await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
         elif update.effective_chat:
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=text)
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id, text=text, reply_markup=MAIN_KEYBOARD
+            )
 
     async def cmd_price(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         prices = await self.get_prices()
@@ -539,7 +551,7 @@ class CryptoBot:
         else:
             msg_lines.append(f"- GAS: ошибка ({gerr})")
 
-        await update.message.reply_text("\n".join(msg_lines))
+        await update.message.reply_text("\n".join(msg_lines), reply_markup=MAIN_KEYBOARD)
 
     async def cmd_set(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда: /set <COIN> <VALUE>
@@ -586,7 +598,7 @@ class CryptoBot:
         lines = ["Текущие пороги:"]
         for symbol, value in self.thresholds.items():
             lines.append(f"- {symbol}: {value}")
-        await update.message.reply_text("\n".join(lines))
+        await update.message.reply_text("\n".join(lines), reply_markup=MAIN_KEYBOARD)
 
     async def run_checks(self):
         while True:
@@ -619,10 +631,15 @@ async def main():
         bot = CryptoBot(session, app, chat_id)
 
         # --- Регистрируем команды ---
-        app.add_handler(CommandHandler("start", bot.cmd_start))
+        app.add_handler(CommandHandler(["start", "menu"], bot.cmd_start))
         app.add_handler(CommandHandler("price", bot.cmd_price))
         app.add_handler(CommandHandler("set", bot.cmd_set))
         app.add_handler(CommandHandler("thresholds", bot.cmd_thresholds))
+        for label, callback in (
+            (BUTTON_PRICE, bot.cmd_price),
+            (BUTTON_THRESHOLDS, bot.cmd_thresholds),
+        ):
+            app.add_handler(MessageHandler(filters.Text([label]), callback))
 
 
         # --- Уведомление о запуске ---
