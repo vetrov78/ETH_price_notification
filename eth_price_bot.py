@@ -37,18 +37,15 @@ THRESHOLDS = {
     "USD_BRL": "USD_BRL_CRITICAL_RATE",
 }
 
-MORPHO_API_URL = "https://api.morpho.org/graphql"
-MORPHO_SUSN_USDC_MARKET_ID = "0x8924445a76b678c536df977ed9222fb0b23ee5311497dd0223fe6270bb20b4e6"
-
 BYBIT_TICKERS_URL = "https://api.bybit.com/v5/market/tickers"
 BYBIT_BRL_SYMBOL = "USDTBRL"
 
 HYPERITHM_VAULT_ADDRESS = "0xD0943c76ee287793559c1dF82E5B2B858Dd01Ef3"
 HYPERITHM_VAULT_URL = f"https://yield.accountable.capital/vaults/{HYPERITHM_VAULT_ADDRESS}"
 ACCOUNTABLE_LOAN_URL = "https://yield.accountable.capital/api/loan/address"
+HYPERITHM_VAULT_MIN_AVAILABLE_USDC = 1_000
 
 # --- Настройки бота ---
-SUSN_METRICS_URL = "https://back.noon.capital/api/v1/protocol-metrics"
 
 # Несколько публичных RPC для фолбэка
 ETH_RPC_URLS = os.getenv(
@@ -98,7 +95,7 @@ class CryptoBot:
         self.scheduler = AsyncIOScheduler()
         self.gas_below_threshold = None
         self.usd_brl_above_threshold = None
-        self.hyperithm_vault_accepting_deposits = None
+        self.hyperithm_vault_alertable_capacity = None
 
         # локальные пороги, которые можно менять во время работы
         self.thresholds = {
@@ -155,105 +152,6 @@ class CryptoBot:
             msg += f"- GAS: ошибка ({gerr})\n"
 
         await self.send_message(msg)
-
-    async def get_susn_metrics(self):
-        try:
-            async with self.session.get(
-                SUSN_METRICS_URL,
-                headers={
-                    "Accept": "application/json",
-                    "User-Agent": "Mozilla/5.0"
-                },
-                timeout=30
-            ) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    return None, f"Noon metrics status {resp.status}: {body[:200]}"
-
-                data = await resp.json(content_type=None)
-
-                apy_7d = None
-
-                # 1) сначала пробуем текущее поле apy
-                if isinstance(data.get("apy"), (str, int, float)):
-                    try:
-                        apy_7d = float(data["apy"])
-                    except (TypeError, ValueError):
-                        pass
-
-                # 2) fallback: берём последнее значение из apyTimeSeries
-                if apy_7d is None and isinstance(data.get("apyTimeSeries"), dict):
-                    ts = data["apyTimeSeries"]
-                    if ts:
-                        last_date = sorted(ts.keys())[-1]
-                        try:
-                            apy_7d = float(ts[last_date])
-                        except (TypeError, ValueError):
-                            pass
-
-                if apy_7d is None:
-                    return None, f"Unexpected Noon payload: {data!r}"
-
-                return {
-                    "apy_7d": apy_7d
-                }, None
-
-        except Exception as e:
-            return None, f"Noon metrics exception: {e}"
-
-    async def get_morpho_susn_usdc_borrow_apy(self):
-        query = """
-        query MarketRate($marketId: String!, $chainId: Int!) {
-        marketById(marketId: $marketId, chainId: $chainId) {
-            marketId
-            state {
-            borrowApy
-            }
-        }
-        }
-        """
-
-        payload = {
-            "query": query,
-            "variables": {
-                "marketId": MORPHO_SUSN_USDC_MARKET_ID,
-                "chainId": 1
-            }
-        }
-
-        try:
-            async with self.session.post(
-                MORPHO_API_URL,
-                json=payload,
-                headers={
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",
-                    "User-Agent": "Mozilla/5.0"
-                },
-                timeout=30
-            ) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    return None, f"Morpho API status {resp.status}: {body[:200]}"
-
-                data = await resp.json(content_type=None)
-
-                if data.get("errors"):
-                    return None, f"Morpho API errors: {data['errors']}"
-
-                market = data.get("data", {}).get("marketById")
-
-                if not market:
-                    return None, f"Unexpected Morpho payload: {data!r}"
-
-                borrow_apy = market.get("state", {}).get("borrowApy")
-                if borrow_apy is None:
-                    return None, f"borrowApy not found: {data!r}"
-
-                return float(borrow_apy), None
-
-        except Exception as e:
-            return None, f"Morpho API exception: {e}"
 
     async def get_usd_brl_rate(self):
         """Возвращает BRL за 1 USDT по последней сделке на Bybit Spot.
@@ -354,38 +252,37 @@ class CryptoBot:
 
                 raw_capacity = loan_terms.get("maxCapacity")
                 decimals = vault_asset.get("decimals")
-                deposits_usd = computed.get("tvl_in_usd")
+                raw_deposits = computed.get("tvl")
                 if (
                     isinstance(raw_capacity, bool)
                     or not isinstance(raw_capacity, (int, float))
                     or isinstance(decimals, bool)
                     or not isinstance(decimals, int)
                     or not 0 <= decimals <= 36
-                    or isinstance(deposits_usd, bool)
-                    or not isinstance(deposits_usd, (int, float))
+                    or isinstance(raw_deposits, bool)
+                    or not isinstance(raw_deposits, (int, float))
                 ):
                     return None, "Unexpected Accountable API payload: invalid capacity or deposit values"
 
                 capacity_usdc = raw_capacity / (10 ** decimals)
-                if (
-                    not math.isfinite(capacity_usdc)
-                    or not math.isfinite(deposits_usd)
-                    or capacity_usdc < 0
-                    or deposits_usd < 0
-                ):
+                deposits_usdc = raw_deposits / (10 ** decimals)
+                if (not math.isfinite(capacity_usdc)
+                        or not math.isfinite(deposits_usdc)
+                        or capacity_usdc < 0
+                        or deposits_usdc < 0):
                     return None, "Unexpected Accountable API payload: non-finite or negative capacity values"
 
                 accepts_deposits = (
                     loan.get("active") is True
                     and computed.get("can_deposit") is True
                     and on_chain.get("paused") is not True
-                    and deposits_usd < capacity_usdc
+                    and deposits_usdc < capacity_usdc
                 )
                 return {
                     "accepts_deposits": accepts_deposits,
                     "capacity_usdc": capacity_usdc,
-                    "deposits_usd": deposits_usd,
-                    "available_usdc": max(0.0, capacity_usdc - deposits_usd),
+                    "deposits_usdc": deposits_usdc,
+                    "available_usdc": max(0.0, capacity_usdc - deposits_usdc),
                 }, None
         except Exception as e:
             return None, f"Accountable API exception: {e}"
@@ -396,17 +293,20 @@ class CryptoBot:
             logger.error(f"Ошибка проверки Hyperithm vault: {err}")
             return
 
-        accepts_deposits = status["accepts_deposits"]
-        if accepts_deposits and self.hyperithm_vault_accepting_deposits is not True:
+        has_alertable_capacity = (
+            status["accepts_deposits"]
+            and status["available_usdc"] > HYPERITHM_VAULT_MIN_AVAILABLE_USDC
+        )
+        if has_alertable_capacity and self.hyperithm_vault_alertable_capacity is not True:
             await self.send_message(
-                "🟢 Hyperithm Delta Neutral Vault сейчас принимает новые депозиты.\n"
-                f"Свободная вместимость: ${status['available_usdc']:,.2f} USDC\n"
-                f"Депозиты / лимит: ${status['deposits_usd']:,.2f} / "
-                f"${status['capacity_usdc']:,.2f} USDC\n"
-                f"{HYPERITHM_VAULT_URL}"
+                "🟢 Hyperithm Delta Neutral Vault сейчас принимает новые депозиты "
+                "и свободная вместимость превышает 1,000 USDC.\n"
+                f"Свободная вместимость: {status['available_usdc']:,.0f} USDC\n"
+                f"Депозиты / лимит: {status['deposits_usdc']:,.0f} / "
+                f"{status['capacity_usdc']:,.0f} USDC\n"
             )
 
-        self.hyperithm_vault_accepting_deposits = accepts_deposits
+        self.hyperithm_vault_alertable_capacity = has_alertable_capacity
 
     # --- Получение информации о газе
     async def get_eth_gas_gwei(self):
@@ -541,8 +441,8 @@ class CryptoBot:
             msg_lines.append(f"- HDNV(dep/lim): ошибка проверки ({vault_error})")
         else:
             msg_lines.append(
-                f"- HDNV(dep/lim): ${vault_status['deposits_usd'] / 1_000_000:.2f}M/"
-                f"${vault_status['capacity_usdc'] / 1_000_000:.2f}M"
+                f"- HDNV(dep/lim): {vault_status['deposits_usdc']:,.0f}/"
+                f"{vault_status['capacity_usdc']:,.0f} USDC"
             )
 
         gas_gwei, gerr = await self.get_eth_gas_gwei()
